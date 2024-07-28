@@ -1,45 +1,57 @@
-import re
-import json
 import requests
+import os
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import re
 from bs4 import BeautifulSoup
-from config import HEADERS, BASE_URL
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from models.category_model import CategoryModel
 
 class ProductCountScraper:
-    def __init__(self, input_file, output_file):
-        self.input_file = input_file
-        self.output_file = output_file
-        self.results = [] 
+    def __init__(self):
+        self.category_model = CategoryModel()
+        self.base_url = os.getenv('BASE_URL')
+        self.headers = { "User-Agent": os.getenv('USER_AGENT') }
+        self.session = self.create_session()
 
-    def process_page(self, url, id, name):
-        # Send a GET request to the URL
-        response = requests.get(url, headers=HEADERS)
+    def create_session(self):
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        session.headers.update(self.headers)
+        return session
 
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            view_switch_elements = soup.find_all(class_='view-switch')
-            
-            # Extract the numbers using regex and remove commas
-            numbers = [int(num.replace(",", "")) for element in view_switch_elements for num in re.findall(r'\d{1,3}(?:,\d{3})*', element.text)]
-            
-            self.results.append({
-                "id": int(id),
-                "name": name,
-                "product_count": numbers[0] if numbers else 0
-            })
-            print(f"Processed ID {id} - Products found: {numbers}")
-        else:
-            print(f"Failed to retrieve the page for ID {id}. Status code: {response.status_code}")
+    def fetch(self, url):
+        try:
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as e:
+            print(f"Failed to retrieve {url}: {e}")
+            return None
 
+    def process_page(self, category):
+        # Process a category page to extract product count
+        id, name = category['id'], category['name']
+        url = f"{self.base_url}/processor-b{id}_0.html"
+        html = self.fetch(url)
+        if html:
+            soup = BeautifulSoup(html, 'lxml')
+            view_switch_element = soup.find('span', class_='view-switch', string=re.compile(r'\d+\s+listings'))
+            if view_switch_element:
+                numbers = int(''.join(re.findall(r'\d+', view_switch_element.text.replace(',', '')))) or 0
+                self.category_model.update_product_count(int(id), numbers)
+                print(f"Processed ID {id} - {name}: Products found: {numbers}")
+            else:
+                print(f"No listings found for ID {id}, {name}.")
 
     def run(self):
-        with open(self.input_file, "r") as json_file:
-            data = json.load(json_file)
+        categories = self.category_model.get_all_categories()
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            list(executor.map(self.process_page, categories))
 
-        for item in data:
-            id = item["id"]
-            name = item["name"]
-            url = f"{BASE_URL}/processor-b{id}_0.html"
-            self.process_page(url, id, name)
-
-        with open(self.output_file, "w") as output_file:
-            json.dump(self.results, output_file, indent=4)
+    def close(self):
+        self.category_model.close()
+        self.session.close()

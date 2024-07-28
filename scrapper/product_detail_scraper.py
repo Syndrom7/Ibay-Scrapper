@@ -1,200 +1,159 @@
-import json
-import os
 import re
-import time
-import sys
-from bs4 import BeautifulSoup
+import os
 import requests
-from config import HEADERS, BASE_URL, RED_COLOR, RESET_COLOR
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+from models.category_model import CategoryModel 
+from models.product_model import ProductModel 
+from models.seller_model import SellerModel 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
 
 class ProductDetailScraper:
-    def __init__(self, input_folder, output_folder):
-        self.input_folder = input_folder
-        self.output_folder = output_folder
+    def __init__(self):
+        self.category_model = CategoryModel()
+        self.product_model = ProductModel()
+        self.seller_model = SellerModel()
+        self.headers = {"User-Agent": os.getenv('USER_AGENT')}
+        self.session = self.create_session()
 
-    def get_product_details(self, url, product_name):
-        try:
-            response = requests.get(url, headers=HEADERS, allow_redirects=False)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # If a product is not found or response code is 404, 301 then skip with values nullified
-            product_name_element = soup.select_one('.iw-details-heading > h5')
-            if not product_name_element or response.status_code == 301 or response.status_code == 404:
-                print(f"Product name not found for {url}. Skipping...")
-                print("\n")
-                
-                product_details = {
-                    "product_name": product_name,
-                    "product_price": None,
-                    "product_images": [],
-                    "product_location": None,
-                    "product_condition": None,
-                    "product_brand": None,
-                    "product_info": [],
-                    "product_description": None,
-                    "product_url": url,
-                    "favourite_count": None,
-                    "seller_number": None,
-                    "seller_url": None,
-                    "seller_name": None,
-                    "listing_id": int(re.search(r'-o(\d+)\.html', url).group(1)),
-                    "last_updated": None
-                }
-                return product_details
-        
-            product_details = {}
+    def create_session(self):
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        session.headers.update(self.headers)
+        return session
 
-            # Extract product name
-            try:
-                product_details['product_name'] = product_name_element.text.strip()
-            except AttributeError:
-                product_details['product_name'] = None
-            
-            # Extract product price
-            try:
-                product_details['product_price'] = soup.select_one('.details-page_product-info .price').text.strip()
-            except AttributeError:
-                product_details['product_price'] = None
-            
-            # Extract product images in an array
-            try:
-                product_details['product_images'] = [img['src'] for img in soup.select('#fullscreen-viewer img')]
-            except AttributeError:
-                product_details['product_images'] = []
-
-            # Extract product infos, if product has location add it to product_location else add everything else to product_info 
-            product_details['product_info'] = []
-            item_info_table_rows = soup.select('.item-info-table > table > tbody > tr')
-            for row in item_info_table_rows:
-                header_element = row.select_one('td:nth-child(1)')
-                value_element = row.select_one('td:nth-child(2)')
-                if header_element is not None and value_element is not None:
-                    header = header_element.text.strip()
-                    value = value_element.text.strip()
-                    if header == 'Location':
-                        product_details['product_location'] = value
-                    else:
-                        # For any additional attributes in the table, add them to product_info array
-                        product_details['product_info'].append({header: value})
-                
-                # Extract product description
-                try:
-                    product_details['product_description'] = soup.select_one('.iw-description-div').get_text()
-                except AttributeError:
-                    product_details['product_description'] = None
-
-                product_details['product_url'] = url
-
-                # Extract favourite count
-                try:
-                    product_details['favourite_count'] = soup.select_one('.no-favorites > span').text
-                except AttributeError:
-                    product_details['favourite_count'] = 0
-
-                # Check if the seller number element exists
-                try:
-                    product_details['seller_number'] = soup.select_one('.i-detail-des-n').text
-                except AttributeError:
-                    product_details['seller_number'] = None
-
-                # Check if the seller URL element exists
-                try:
-                    product_details['seller_url'] = f"{BASE_URL}/" + soup.select_one('.iw-user-name')['href']
-                except AttributeError:
-                    product_details['seller_url'] = None
-
-                try:
-                    product_details['seller_name'] = soup.select_one('.iw-user-name > b').text
-                except AttributeError:
-                    product_details['seller_name'] = None
-
-                # Extract the listing ID from the URL
-                try:
-                    product_details['listing_id'] = int(re.search(r'-o(\d+)\.html', url).group(1))
-                except AttributeError:
-                    product_details['listing_id'] = None
-
-                # Extract the last updated date from the page content
-                last_updated_element = soup.find('div', string=re.compile('Last Updated : '))
-                if last_updated_element:
-                    last_updated_text = last_updated_element.text
-                    last_updated_date = re.search(r'Last Updated : (\d{1,2}-[A-Za-z]{3}-\d{4})', last_updated_text)
-                    if last_updated_date:
-                        product_details['last_updated'] = last_updated_date.group(1)
-                    else:
-                        product_details['last_updated'] = None
+    # Extract seller ID from the seller URL
+    def extract_seller_id(self, seller_url):
+        # Example URL: https://ibay.com.mv/index.php?page=profile&id=76650
+        match = re.search(r'id=(\d+)', seller_url)
+        return int(match.group(1)) if match else None
+    
+    # Product price extraction
+    def extract_price(self, soup):
+        product_price_element  = soup.select_one('.details-page_product-info .price')
+        return float(re.sub(r'[^\d.]+', '', product_price_element.text.strip())) if product_price_element else None
+    
+    # Product description extraction
+    def extract_description(self, soup):
+        product_desc_element = soup.select_one('.iw-description-div')
+        return product_desc_element.get_text().strip() if product_desc_element else None
+    
+    # Product images extraction
+    def extract_product_images(self, soup):
+        image_elements = soup.select('#fullscreen-viewer img')
+        return [img['src'] for img in image_elements] if image_elements else []
+    
+    # Product last update extraction
+    def extract_last_updated(self, soup):
+        last_updated_element = soup.find('div', string=re.compile('Last Updated : '))
+        if last_updated_element:
+            last_updated_text = last_updated_element.text
+            last_updated_date_match = re.search(r'Last Updated : (\d{1,2}-[A-Za-z]{3}-\d{4})', last_updated_text)
+            return last_updated_date_match.group(1) if last_updated_date_match else None
+        return None
+    
+    # Product info extraction
+    def extract_product_info(self, soup):
+        product_info = []
+        location = None
+        item_info_table_rows = soup.select('.item-info-table > table > tbody > tr')
+        for row in item_info_table_rows:
+            key_element = row.select_one('td:nth-child(1)')
+            value_element = row.select_one('td:nth-child(2)')
+            if key_element and value_element:
+                key = key_element.text.strip()
+                value = value_element.text.strip()
+                if key == 'Location':
+                    location = value
                 else:
-                    product_details['last_updated'] = None
+                    product_info.append({key: value})
+        return product_info, location
+    
+    # Product categories extraction
+    def extract_categories(self, soup):
+        breadcrumb_elements = soup.select('div a.breadcrumb.dark[href*="b"]')
+        return [int(match.group(1)) for element in breadcrumb_elements 
+                if (match := re.search(r'b(\d+)', element['href']))]
+    
+    def get_product_details(self, product_id, product_name, url):
+        try:
+            response = self.session.get(url, timeout=10)
+            if response.status_code in [301, 404]:
+                self.product_model.update_product_status(product_id, 'ERROR', response.status_code)
+                return None
+
+            soup = BeautifulSoup(response.content, 'lxml')
+
+            # Check if the listing is disabled
+            if soup.find('font', class_='pagetitle', text='Listing disabled') or soup.find('p', class_='pagetitle', text='Listing not found'):
+                self.product_model.update_product_status(product_id, 'ERROR', 'Listing disabled or not found')
+                print(f"Listing for {product_id} is not available. Skipping...")
+                return None
+
+            # Seller info extraction
+            seller_url = soup.select_one('.iw-user-name')['href']
+            seller_id = self.extract_seller_id(seller_url)
+            seller_name = soup.select_one('.iw-user-name > b').text.strip() if soup.select_one('.iw-user-name > b') else None
+            contact_number = soup.select_one('.i-detail-des-n').text.strip() if soup.select_one('.i-detail-des-n') else None
+
+            seller_details = {
+                'id': seller_id,
+                'name': seller_name,
+                'contact_number': contact_number
+            }
+
+            self.seller_model.insert_seller(seller_details)
+
+            # Extract product details
+            info, location = self.extract_product_info(soup)
+            product_details = {
+                'price': self.extract_price(soup),
+                'description': self.extract_description(soup),
+                'images': self.extract_product_images(soup),
+                'product_info': info,
+                'product_location': location,
+                'last_updated': self.extract_last_updated(soup),
+                'seller_id': seller_id
+            }
+
+            # Update product table with details
+            self.product_model.update_product(product_id, product_details)
+
+            # Insert product categories
+            product_categories = self.extract_categories(soup)
+            self.product_model.insert_product_categories(product_id, product_categories)
+
+            # Insert product images
+            self.product_model.insert_product_images(product_id, product_details['images'])
+
+            # Insert product information key-value pairs
+            self.product_model.insert_product_info_bulk(product_id, product_details['product_info'])
+
+            # If all goes well, update the product status to 'SCRAPED'
+            self.product_model.update_product_status(product_id, 'SCRAPED')
+
+            print(f"Scraped: {product_name}")
             return product_details
 
         except Exception as e:
             print(f"Error occurred while processing {url}: {e}")
+            self.product_model.update_product_status(product_id, 'ERROR', str(e))
             sys.exit(1)
 
     def run(self):
-        start_time = time.time()
-        os.makedirs(self.output_folder, exist_ok=True)
-        input_files = [f for f in os.listdir(self.input_folder) if f.endswith('.json')]
+        products = self.product_model.get_products_by_status('NOT_SCRAPED')
 
-        for input_file in input_files:
-            input_file_path = os.path.join(self.input_folder, input_file)
-            try:
-                with open(input_file_path, 'r') as json_file:
-                    data = json.load(json_file)
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                print(f"Error while reading {input_file}: {e}")
-                continue
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            futures = [executor.submit(self.get_product_details, product[0], product[1], product[2]) for product in products]
+            for future in futures:
+                future.result()
 
-            all_categories_data = []
-            total_products = sum(len(category['products']) for category in data)
-
-            current_category = 0
-            current_product = 0
-
-            for category in data:
-                category_id = category['category_id']
-                category_name = category['category_name']
-                products = category['products']
-                print(f"\nFetching details for Category ID: {category_id} - Category Name: {category_name}")
-
-                category_data = {
-                    "category_id": category_id,
-                    "category_name": category_name,
-                    "products": []
-                }
-
-                for product in products:
-                    current_category += 1
-                    current_product += 1
-
-                    product_url = product['product_url']
-                    product_name = product['product_name']
-                    print(f"Fetching details for {product_url}")
-                    product_fetch_time = time.time()
-                    product_details = self.get_product_details(product_url, product_name)
-
-                    if product_details:
-                        category_data['products'].append(product_details)
-                        print(f"\rProcessed Product {current_product}/{total_products} - Category {category_id}", end="")
-                        product_fetch_time_diff = time.time() - product_fetch_time
-                        print(f'{RED_COLOR} | Time Elapsed: %.2f seconds.{RESET_COLOR}' % product_fetch_time_diff)
-                        print("\n")
-                    else:
-                        print(f"\rFailed to fetch details for Product {current_product}/{total_products} - Category {category_id}", end="")
-                        print("\n")
-                        sys.exit(1)
-
-                all_categories_data.append(category_data)
-
-            output_file_name = input_file.split('.')[0] + ".json"
-            output_file_path = os.path.join(self.output_folder, output_file_name)
-
-            with open(output_file_path, "w") as output_file:
-                json.dump(all_categories_data, output_file, indent=4)
-
-            os.remove(input_file_path)
-            print(f"Deleted file: {input_file}")
-
-            time_difference = time.time() - start_time
-            print(f'{RED_COLOR}Category Scraping time: %.2f seconds.{RESET_COLOR}' % time_difference)
+    def close(self):
+        self.category_model.close()
+        self.product_model.close()
+        self.seller_model.close()

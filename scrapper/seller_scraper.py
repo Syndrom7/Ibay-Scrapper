@@ -1,85 +1,66 @@
 import requests
+import os
 from bs4 import BeautifulSoup
-import json
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import sys
-import time
-from config import HEADERS, BASE_URL, RED_COLOR, RESET_COLOR
+from models.seller_model import SellerModel 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class SellerScraper:
-    def __init__(self, input_file, output_file):
-        self.input_file = input_file
-        self.output_file = output_file
+    def __init__(self):
+        self.seller_model = SellerModel()
+        self.base_url = os.getenv('BASE_URL')
+        self.headers = {"User-Agent": os.getenv('USER_AGENT')}
+        self.session = self._create_session()
 
+    def _create_session(self):
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        session.headers.update(self.headers)
+        return session
+    
     def extract_seller_info(self, seller_id):
-        try:
-            # Start time
-            start_time = time.time()
-            
-            print("Fetching Seller id: " + str(seller_id))
-            url = f"{BASE_URL}/index.php?page=profile&id={seller_id}"
-            response = requests.get(url, headers=HEADERS)
+        try: 
+            print(f"Fetching Seller id: {seller_id}")
+            url = f"{self.base_url}/index.php?page=profile&id={seller_id}"
+            response = self.session.get(url, timeout=10)
 
             if response.status_code != 200:
+                print(f"Failed to fetch seller {seller_id}, status code: {response.status_code}")
                 return None
 
-            soup = BeautifulSoup(response.content, 'html.parser')
+            soup = BeautifulSoup(response.content, 'lxml')
             
-            # Extracting the seller's image
-            image_element = soup.select_one('.bg-light .col.s6.l2 img[src]')
-            image_src = image_element['src'] if image_element else None
-
-            # Checking if the seller is premium
-            is_premium_element = soup.select_one('.bg-light .col.s6.l4 img[alt="Premium Seller"]')
-            is_premium = 1 if is_premium_element else 0
-
-            # Extracting the seller description
-            description_element = soup.select_one('.bg-light .col.s12.l6 p')
-            seller_description = description_element.get_text() if description_element else None
-
-            # Extracting the seller location
-            location_element = soup.select_one('.bg-light .col.s12.l6 p b:nth-child(1)')
-            seller_location = location_element.get_text() if location_element else None
-
-            # Extracting the member since date
-            member_since_element = soup.select_one('.bg-light .col.s12.l6 p b:nth-child(2)')
-            member_since = member_since_element.get_text() if member_since_element else None
-
-            # Extracting the last login date
-            last_login_element = soup.select_one('.bg-light .col.s12.l6 p:nth-of-type(3) b')
-            last_login = last_login_element.next_sibling.strip() if last_login_element else None
-            
-            # End time 
-            time_difference = time.time() - start_time
-            print(f'{RED_COLOR}Time Elapsed: %.2f seconds.{RESET_COLOR}' % time_difference)
-            print("\n")
-
-            return {
-                "seller_id": seller_id,
-                "image_src": "https://" + image_src,
-                "isPremium": is_premium,
-                "seller_description": seller_description,
-                "seller_location": seller_location,
-                "member_since": member_since,
-                "last_login": last_login
+            seller_info = {
+                "id": seller_id,
+                "image_src": "https://" + (soup.select_one('.bg-light .col.s6.l2 img[src]')['src'] if soup.select_one('.bg-light .col.s6.l2 img[src]') else ''),
+                "is_premium": bool(soup.select_one('.bg-light .col.s6.l4 img[alt="Premium Seller"]')),
+                "description": soup.select_one('.bg-light .col.s12.l6 p').get_text() if soup.select_one('.bg-light .col.s12.l6 p') else None,
+                "location": soup.select_one('.bg-light .col.s12.l6 p b:nth-child(1)').get_text() if soup.select_one('.bg-light .col.s12.l6 p b:nth-child(1)') else None,
+                "member_since": soup.select_one('.bg-light .col.s12.l6 p b:nth-child(2)').get_text() if soup.select_one('.bg-light .col.s12.l6 p b:nth-child(2)') else None,
+                "last_login": soup.select_one('.bg-light .col.s12.l6 p:nth-of-type(3) b').next_sibling.strip() if soup.select_one('.bg-light .col.s12.l6 p:nth-of-type(3) b') else None
             }
-        except Exception as e:
+
+            self.seller_model.update_seller(seller_info)
+            return seller_info
+
+        except requests.RequestException as e:
             print(f"Error occurred while processing seller ID {seller_id}: {e}")
-            sys.exit(1)
+            return None
 
     def run(self):
-        with open(self.input_file, 'r') as file:
-            json_data = json.load(file)
+        seller_ids = self.seller_model.fetch_seller_ids()
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(self.extract_seller_info, sid) for sid in seller_ids]
+            for future in as_completed(futures):
+                future.result()
 
-        seller_info_list = []
+        print("Completed updating all sellers.")
 
-        for item in json_data:
-            seller_id = item['seller_id']
-            seller_info = self.extract_seller_info(seller_id)
-            if seller_info:
-                seller_info_list.append(seller_info)
-
-        with open(self.output_file, 'w') as file:
-            json.dump(seller_info_list, file, indent=2)
-
-        print("Seller information extracted and saved to " + self.output_file)
-
+    def close(self):
+        self.seller_model.close()
+        self.session.close()
