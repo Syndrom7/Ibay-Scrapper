@@ -8,6 +8,7 @@ from scrapper.category_product_link_scrapper import CategoryProductLinkScraper
 from scrapper.product_detail_scraper import ProductDetailScraper
 from scrapper.seller_scraper import SellerScraper
 from scrapper.product_updater import ProductUpdater
+from scrapper.stale_product_updater import StaleProductUpdater
 
 async def run_scraper(scraper_instance, method_name='run', **kwargs):
     """
@@ -33,13 +34,14 @@ def main_menu():
     print("4. Scrape Product Details")
     print("5. Scrape Seller Information")
     print("6. Scrape New Products")
-    print("7. Exit")
+    print("7. Update Stale Products")
+    print("8. Exit")
 
 async def async_main():
     """Main async function to run the scraper"""
     while True:
         main_menu()
-        choice = input("Enter your choice (1-7): ")
+        choice = input("Enter your choice (1-8): ")
         
         if choice == '1':
             category_scraper = CategoryScraper()
@@ -65,10 +67,24 @@ async def async_main():
             updater = ProductUpdater()
             await run_scraper(updater, days=days, category_id=category_id)
         elif choice == '7':
+            days = int(input("Enter number of days to consider stale (default: 30): ") or "30")
+            category_id = input("Enter category ID to filter (optional): ") or None
+            if category_id:
+                category_id = int(category_id)
+            
+            limit = input("Enter maximum number of products to update (optional): ") or None
+            if limit:
+                limit = int(limit)
+                
+            status = input("Enter product status to filter (default: SCRAPED): ") or "SCRAPED"
+            
+            stale_updater = StaleProductUpdater()
+            await run_scraper(stale_updater, days=days, category_id=category_id, status=status, limit=limit)
+        elif choice == '8':
             print("Exiting the program.")
             break
         else:
-            print("Invalid choice. Please enter a number between 1 and 7.")
+            print("Invalid choice. Please enter a number between 1 and 8.")
 
 def main():
     """Entry point to run the async main function"""
