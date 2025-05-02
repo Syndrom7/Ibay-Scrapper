@@ -1,14 +1,13 @@
+# scrapper/product_detail_scraper.py
+
 import re
 import os
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import aiohttp
+import asyncio
 from bs4 import BeautifulSoup
 from models.category_model import CategoryModel 
 from models.product_model import ProductModel 
 from models.seller_model import SellerModel 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import sys
 
 class ProductDetailScraper:
     def __init__(self):
@@ -16,16 +15,15 @@ class ProductDetailScraper:
         self.product_model = ProductModel()
         self.seller_model = SellerModel()
         self.headers = {"User-Agent": os.getenv('USER_AGENT')}
-        self.session = self.create_session()
-
-    def create_session(self):
-        session = requests.Session()
-        retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
-        adapter = HTTPAdapter(max_retries=retries)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        session.headers.update(self.headers)
-        return session
+        self.session = None
+        self.semaphore = asyncio.Semaphore(12)  # Limit concurrent requests to 12
+        
+    async def init_session(self):
+        """Initialize aiohttp session"""
+        if self.session is None:
+            timeout = aiohttp.ClientTimeout(total=30)
+            self.session = aiohttp.ClientSession(headers=self.headers, timeout=timeout)
+        return self.session
 
     # Extract seller ID from the seller URL
     def extract_seller_id(self, seller_url):
@@ -35,7 +33,7 @@ class ProductDetailScraper:
     
     # Product price extraction
     def extract_price(self, soup):
-        product_price_element  = soup.select_one('.details-page_product-info .price')
+        product_price_element = soup.select_one('.details-page_product-info .price')
         return float(re.sub(r'[^\d.]+', '', product_price_element.text.strip())) if product_price_element else None
     
     # Product description extraction
@@ -80,80 +78,116 @@ class ProductDetailScraper:
         return [int(match.group(1)) for element in breadcrumb_elements 
                 if (match := re.search(r'b(\d+)', element['href']))]
     
-    def get_product_details(self, product_id, product_name, url):
-        try:
-            response = self.session.get(url, timeout=10)
-            if response.status_code in [301, 404]:
-                self.product_model.update_product_status(product_id, 'ERROR', response.status_code)
-                return None
+    async def get_product_details(self, product_id, product_name, url):
+        """
+        Get detailed information for a product
+        
+        Args:
+            product_id (int): Product ID
+            product_name (str): Product name
+            url (str): Product URL
+            
+        Returns:
+            dict or None: Product details or None if error
+        """
+        session = await self.init_session()
+        
+        # Use semaphore to limit concurrent requests
+        async with self.semaphore:
+            try:
+                async with session.get(url, timeout=30) as response:
+                    if response.status in [301, 404]:
+                        await self.product_model.update_product_status(product_id, 'ERROR', f"Status code: {response.status}")
+                        return None
+                        
+                    if response.status != 200:
+                        await self.product_model.update_product_status(product_id, 'ERROR', f"Status code: {response.status}")
+                        return None
 
-            soup = BeautifulSoup(response.content, 'lxml')
+                    content = await response.text()
+                    soup = BeautifulSoup(content, 'lxml')
 
-            # Check if the listing is disabled
-            if soup.find('font', class_='pagetitle', text='Listing disabled') or soup.find('p', class_='pagetitle', text='Listing not found'):
-                self.product_model.update_product_status(product_id, 'ERROR', 'Listing disabled or not found')
-                print(f"Listing for {product_id} is not available. Skipping...")
-                return None
+                    # Check if the listing is disabled
+                    if soup.find('font', class_='pagetitle', text='Listing disabled') or soup.find('p', class_='pagetitle', text='Listing not found'):
+                        await self.product_model.update_product_status(product_id, 'ERROR', 'Listing disabled or not found')
+                        print(f"Listing for {product_id} is not available. Skipping...")
+                        return None
 
-            # Seller info extraction
-            seller_url = soup.select_one('.iw-user-name')['href']
-            seller_id = self.extract_seller_id(seller_url)
-            seller_name = soup.select_one('.iw-user-name > b').text.strip() if soup.select_one('.iw-user-name > b') else None
-            contact_number = soup.select_one('.i-detail-des-n').text.strip() if soup.select_one('.i-detail-des-n') else None
+                    # Seller info extraction
+                    seller_url = soup.select_one('.iw-user-name')['href']
+                    seller_id = self.extract_seller_id(seller_url)
+                    seller_name = soup.select_one('.iw-user-name > b').text.strip() if soup.select_one('.iw-user-name > b') else None
+                    contact_number = soup.select_one('.i-detail-des-n').text.strip() if soup.select_one('.i-detail-des-n') else None
 
-            seller_details = {
-                'id': seller_id,
-                'name': seller_name,
-                'contact_number': contact_number
-            }
+                    seller_details = {
+                        'id': seller_id,
+                        'name': seller_name,
+                        'contact_number': contact_number
+                    }
 
-            self.seller_model.insert_seller(seller_details)
+                    await self.seller_model.insert_seller(seller_details)
 
-            # Extract product details
-            info, location = self.extract_product_info(soup)
-            product_details = {
-                'price': self.extract_price(soup),
-                'description': self.extract_description(soup),
-                'images': self.extract_product_images(soup),
-                'product_info': info,
-                'product_location': location,
-                'last_updated': self.extract_last_updated(soup),
-                'seller_id': seller_id
-            }
+                    # Extract product details
+                    info, location = self.extract_product_info(soup)
+                    product_details = {
+                        'price': self.extract_price(soup),
+                        'description': self.extract_description(soup),
+                        'images': self.extract_product_images(soup),
+                        'product_info': info,
+                        'product_location': location,
+                        'last_updated': self.extract_last_updated(soup),
+                        'seller_id': seller_id
+                    }
 
-            # Update product table with details
-            self.product_model.update_product(product_id, product_details)
+                    # Update product table with details
+                    await self.product_model.update_product(product_id, product_details)
 
-            # Insert product categories
-            product_categories = self.extract_categories(soup)
-            self.product_model.insert_product_categories(product_id, product_categories)
+                    # Insert product categories
+                    product_categories = self.extract_categories(soup)
+                    await self.product_model.insert_product_categories(product_id, product_categories)
 
-            # Insert product images
-            self.product_model.insert_product_images(product_id, product_details['images'])
+                    # Insert product images
+                    await self.product_model.insert_product_images(product_id, product_details['images'])
 
-            # Insert product information key-value pairs
-            self.product_model.insert_product_info_bulk(product_id, product_details['product_info'])
+                    # Insert product information key-value pairs
+                    await self.product_model.insert_product_info_bulk(product_id, product_details['product_info'])
 
-            # If all goes well, update the product status to 'SCRAPED'
-            self.product_model.update_product_status(product_id, 'SCRAPED')
+                    # If all goes well, update the product status to 'SCRAPED'
+                    await self.product_model.update_product_status(product_id, 'SCRAPED')
 
-            print(f"Scraped: {product_name}")
-            return product_details
+                    print(f"Scraped: {product_name}")
+                    return product_details
 
-        except Exception as e:
-            print(f"Error occurred while processing {url}: {e}")
-            self.product_model.update_product_status(product_id, 'ERROR', str(e))
-            sys.exit(1)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"Error occurred while processing {url}: {e}")
+                await self.product_model.update_product_status(product_id, 'ERROR', str(e))
+            except Exception as e:
+                print(f"Unexpected error while processing {url}: {e}")
+                await self.product_model.update_product_status(product_id, 'ERROR', str(e))
+                
+            return None
 
-    def run(self):
-        products = self.product_model.get_products_by_status('NOT_SCRAPED')
+    async def run(self):
+        """Run the product detail scraper"""
+        products = await self.product_model.get_products_by_status('NOT_SCRAPED')
+        
+        # Process products in batches
+        batch_size = 20
+        for i in range(0, len(products), batch_size):
+            batch = products[i:i + batch_size]
+            tasks = [
+                self.get_product_details(product[0], product[1], product[2]) 
+                for product in batch
+            ]
+            await asyncio.gather(*tasks)
+            
+            # Small delay between batches
+            await asyncio.sleep(1)
 
-        with ThreadPoolExecutor(max_workers=12) as executor:
-            futures = [executor.submit(self.get_product_details, product[0], product[1], product[2]) for product in products]
-            for future in futures:
-                future.result()
-
-    def close(self):
-        self.category_model.close()
-        self.product_model.close()
-        self.seller_model.close()
+    async def close(self):
+        """Close connections and resources"""
+        if self.session:
+            await self.session.close()
+        await self.category_model.close()
+        await self.product_model.close()
+        await self.seller_model.close()

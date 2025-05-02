@@ -1,12 +1,11 @@
-import requests
-import time
+# scrapper/category_product_link_scrapper.py
+
+import aiohttp
 import os
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import asyncio
 from bs4 import BeautifulSoup
 from models.category_model import CategoryModel
 from models.product_model import ProductModel
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 
 class CategoryProductLinkScraper:
     def __init__(self):
@@ -14,97 +13,115 @@ class CategoryProductLinkScraper:
         self.product_model = ProductModel()
         self.base_url = os.getenv('BASE_URL')
         self.headers = {"User-Agent": os.getenv('USER_AGENT')}
-        self.max_workers = 5
-        self.session = self._create_session()
+        self.session = None
+        self.semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
+        
+    async def init_session(self):
+        """Initialize aiohttp session"""
+        if self.session is None:
+            timeout = aiohttp.ClientTimeout(total=30)
+            self.session = aiohttp.ClientSession(headers=self.headers, timeout=timeout)
+        return self.session
 
-    def _create_session(self):
-        session = requests.Session()
-        retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
-        adapter = HTTPAdapter(max_retries=retries)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        session.headers.update(self.headers)
-        return session
-
-    def scrape_page(self, id, page_count):
+    async def scrape_page(self, id, page_count):
+        """
+        Scrape a single page of product links
+        
+        Args:
+            id (int): Category ID
+            page_count (int): Page number
+            
+        Returns:
+            tuple: Page number and list of product dictionaries or None if no products
+        """
+        session = await self.init_session()
         current_url = f"{self.base_url}?page=search&s_res=GO&lite=0&cid={id}&hw_num=100&off={page_count}"
         
-        try: 
-            response = self.session.get(current_url, timeout=30)
-            response.raise_for_status()
+        # Use semaphore to limit concurrent requests
+        async with self.semaphore:
+            try:
+                async with session.get(current_url) as response:
+                    if response.status != 200:
+                        print(f"HTTP error {response.status} for {current_url}")
+                        return (page_count, None)
+                    
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'lxml')
+                    product_items = soup.find_all(class_='bg-light latest-list-item')
+                    
+                    if not product_items:
+                        return (page_count, None)
+
+                    products = [
+                        {
+                            'listing_id': int(item.find('div', class_='col m7 s8').h5.a['href'].split('-o')[-1].split('.html')[0]),
+                            'name': item.find('div', class_='col m7 s8').h5.a.text.strip(),
+                            'url': self.base_url + "/" + item.find('div', class_='col m7 s8').h5.a['href']
+                        }
+                        for item in product_items
+                    ]
+                    return (page_count, products)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"Request error: {e} for {current_url}")
+            except Exception as e:
+                print(f"Unexpected error: {e} for {current_url}")
             
-            soup = BeautifulSoup(response.content, 'lxml')
-            product_items = soup.find_all(class_='bg-light latest-list-item')
-            
-            if not product_items:
-                return (page_count, None)
+            return (page_count, None)
 
-            products = [
-                {
-                    'listing_id': int(item.find('div', class_='col m7 s8').h5.a['href'].split('-o')[-1].split('.html')[0]),
-                    'name': item.find('div', class_='col m7 s8').h5.a.text.strip(),
-                    'url': self.base_url + "/" + item.find('div', class_='col m7 s8').h5.a['href']
-                }
-                for item in product_items
-            ]
-            return (page_count, products)
-        except requests.HTTPError as e:
-            if e.response.status_code == 404:
-                print(f"Page not found for Category ID: {id}, Page: {page_count}")
-            else:
-                print(f"HTTP error {e.response.status_code} for {current_url}")
-        except requests.RequestException as e:
-            print(f"Request error: {e} for {current_url}")
-        return (page_count, None)
-
-
-    def process_products(self, category):
+    async def process_category(self, category):
+        """
+        Process all pages for a category
+        
+        Args:
+            category (dict): Category information with id and name
+        """
         id, name = category['id'], category['name']
         page_count = 0
         total_products = 0
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {}
-            stop_page = 0
-
-            while stop_page == 0:
-                if page_count in futures:
-                    # Wait for the current page to complete
-                    done, _ = wait([futures[page_count]], return_when="FIRST_COMPLETED")
-                    future = done.pop()
-                    page, products = future.result()
-
-                    if products is None:
-                        print(f"No more products found for Category ID: {id}, Name: {name}, Page: {page}. Ending scrape.")
-                        stop_page = page
-                        break
-
-                    self.product_model.bulk_insert_products(products)
-                    total_products += len(products)
-                    print(f"Scraped {len(products)} products for Category ID: {id}, Name: {name}, Page: {page}")
-
-                    # Remove the completed future
-                    del futures[page_count]
-
-                # Launch new workers for the next pages
-                for i in range(page_count, page_count + self.max_workers):
-                    if i not in futures:
-                        futures[i] = executor.submit(self.scrape_page, id, i)
-
-                page_count += 1
-
+        
+        # Continue scraping pages until no more products are found
+        while True:
+            page, products = await self.scrape_page(id, page_count)
+            
+            if products is None:
+                print(f"No more products found for Category ID: {id}, Name: {name}, Page: {page_count}. Ending scrape.")
+                break
+                
+            await self.product_model.bulk_insert_products(products)
+            total_products += len(products)
+            print(f"Scraped {len(products)} products for Category ID: {id}, Name: {name}, Page: {page_count}")
+            
+            page_count += 1
+            
+            # Small delay to avoid overwhelming the server
+            await asyncio.sleep(0.2)
+            
         print(f"Completed scraping for Category ID: {id}, Name: {name}. Total products processed: {total_products}")
 
-    def run(self):
+    async def run(self):
+        """Run the category product link scraper"""
         print("Starting the scraping process...")
-        try:
-            parent_categories = self.category_model.get_parent_categories()
-            for category in parent_categories:
-                self.process_products(category)
-        finally:
-            self.close()
+        parent_categories = await self.category_model.get_parent_categories()
+        
+        # Process categories in parallel but limit concurrency to avoid overwhelming the server
+        tasks = []
+        for category in parent_categories:
+            task = asyncio.create_task(self.process_category(category))
+            tasks.append(task)
+            # Start 3 categories at a time
+            if len(tasks) >= 3:
+                await asyncio.gather(*tasks)
+                tasks = []
+                
+        # Process any remaining categories
+        if tasks:
+            await asyncio.gather(*tasks)
+            
         print("All parent categories processed. Scraping complete.")
 
-    def close(self):
-        self.category_model.close()
-        self.product_model.close()
-        self.session.close()
+    async def close(self):
+        """Close connections and resources"""
+        if self.session:
+            await self.session.close()
+        await self.category_model.close()
+        await self.product_model.close()

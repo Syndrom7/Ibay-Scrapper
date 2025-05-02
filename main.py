@@ -1,3 +1,7 @@
+# main.py
+
+import asyncio
+import platform
 from scrapper.category_scrapper import CategoryScraper
 from scrapper.product_count_scraper import ProductCountScraper
 from scrapper.category_product_link_scrapper import CategoryProductLinkScraper
@@ -5,9 +9,24 @@ from scrapper.product_detail_scraper import ProductDetailScraper
 from scrapper.seller_scraper import SellerScraper
 from scrapper.product_updater import ProductUpdater
 
+async def run_scraper(scraper_instance, method_name='run', **kwargs):
+    """
+    Run a scraper instance's method and ensure proper cleanup
+    
+    Args:
+        scraper_instance: Scraper instance to run
+        method_name (str): Method name to run (default: 'run')
+        **kwargs: Additional arguments to pass to the method
+    """
+    try:
+        method = getattr(scraper_instance, method_name)
+        await method(**kwargs)
+    finally:
+        await scraper_instance.close()
 
 def main_menu():
-    print("\nIbay Scrapper")
+    """Display the main menu"""
+    print("\nAsync Ibay Scrapper")
     print("1. Scrape Categories")
     print("2. Scrape Product Counts")
     print("3. Scrape Category Product Links")
@@ -16,44 +35,57 @@ def main_menu():
     print("6. Scrape New Products")
     print("7. Exit")
 
-def main():
+async def async_main():
+    """Main async function to run the scraper"""
     while True:
         main_menu()
         choice = input("Enter your choice (1-7): ")
         
         if choice == '1':
             category_scraper = CategoryScraper()
-            category_scraper.run()
-            category_scraper.close()
+            await run_scraper(category_scraper)
         elif choice == '2':
             count_scraper = ProductCountScraper()
-            count_scraper.run()
-            count_scraper.close()
+            await run_scraper(count_scraper)
         elif choice == '3':
             link_scraper = CategoryProductLinkScraper()
-            link_scraper.run()
-            link_scraper.close()
-            pass
+            await run_scraper(link_scraper)
         elif choice == '4':
             details_scraper = ProductDetailScraper()
-            details_scraper.run()
-            details_scraper.close()
-            pass
+            await run_scraper(details_scraper)
         elif choice == '5':
             seller_scraper = SellerScraper()
-            seller_scraper.run()
-            seller_scraper.close()
-            pass
+            await run_scraper(seller_scraper)
         elif choice == '6':
+            days = int(input("Enter number of days (default: 3): ") or "3")
+            category_id = input("Enter category ID (optional): ") or None
+            if category_id:
+                category_id = int(category_id)
+            
             updater = ProductUpdater()
-            updater.run(days=3)
-            updater.close()
-            pass
+            await run_scraper(updater, days=days, category_id=category_id)
         elif choice == '7':
             print("Exiting the program.")
             break
         else:
-            print("Invalid choice. Please enter a number between 1 and 6.")
+            print("Invalid choice. Please enter a number between 1 and 7.")
+
+def main():
+    """Entry point to run the async main function"""
+    # Fix for Windows: Use SelectorEventLoop instead of ProactorEventLoop
+    if platform.system() == 'Windows':
+        # Import needed modules for Windows fix
+        import asyncio
+        import sys
+        
+        # Set the event loop policy to use SelectorEventLoop on Windows
+        if sys.version_info >= (3, 8):
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+        print("Windows detected: Using SelectorEventLoop for better compatibility")
+    
+    # Run the async main function
+    asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()
