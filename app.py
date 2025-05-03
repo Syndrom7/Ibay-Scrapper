@@ -71,8 +71,8 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # Dependency to get task by ID
-async def get_task_by_id(task_id: str) -> Task:
-    task = await task_manager.get_task(task_id)
+def get_task_by_id(task_id: str) -> Task:
+    task = task_manager.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return task
@@ -83,7 +83,7 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
     await manager.connect(websocket, task_id)
     try:
         # Send initial task status upon connection
-        task = await task_manager.get_task(task_id)
+        task = task_manager.get_task(task_id)
         if task:
             await websocket.send_json({
                 "type": "status",
@@ -113,38 +113,10 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                             "timestamp": log["timestamp"],
                             "level": log.get("level", "INFO")
                         })
+    finally:
+        await manager.disconnect(websocket, task_id)
+
         
-        # Keep connection alive and handle client messages
-        while True:
-            data = await websocket.receive_text()
-            
-            # Client can send commands through websocket
-            if data == "stop":
-                await task_manager.stop_task(task_id)
-                await websocket.send_json({
-                    "type": "status",
-                    "status": "STOPPING",
-                    "message": "Stopping task..."
-                })
-            elif data == "pause":
-                await task_manager.pause_task(task_id)
-                await websocket.send_json({
-                    "type": "status",
-                    "status": "PAUSED",
-                    "message": "Pausing task..."
-                })
-            elif data == "resume":
-                await task_manager.resume_task(task_id)
-                await websocket.send_json({
-                    "type": "status",
-                    "status": "RESUMING",
-                    "message": "Resuming task..."
-                })
-    except WebSocketDisconnect:
-        manager.disconnect(websocket, task_id)
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        manager.disconnect(websocket, task_id)
 
 # Endpoints for listing available scrapers
 @app.get("/api/scrapers", response_model=List[str])
@@ -230,13 +202,19 @@ async def resume_task(task: Task = Depends(get_task_by_id)):
 async def get_task_logs(task_id: str, limit: int = 100, offset: int = 0):
     """Get logs for a specific task"""
     # Verify the task exists
-    task = await task_manager.get_task(task_id)
+    task = task_manager.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         
-    # Get logs from database
-    log_data = await task_manager.task_log_model.get_task_logs(task_id, limit, offset)
-    return log_data
+    try:
+        # Get logs from database
+        log_data = await task_manager.task_log_model.get_task_logs(task_id, limit, offset)
+        return log_data
+    except Exception as e:
+        logger.error(f"Error getting task logs: {e}")
+        # Fall back to in-memory logs if database query fails
+        logs = task.logs[offset:offset+limit] if offset < len(task.logs) else []
+        return {"logs": logs, "total": len(task.logs)}
 
 # Endpoints for each scraper type
 @app.post("/api/scrapers/category", response_model=TaskResponse)
