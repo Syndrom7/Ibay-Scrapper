@@ -4,3 +4,4 @@ scrapper/__pycache__
 .env
 data.sql
 query.sql
+ibay_scraper_api.log

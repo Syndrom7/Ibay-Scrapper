@@ -165,6 +165,24 @@ class BaseModel:
                 info_value TEXT,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );''',
+            '''CREATE TABLE IF NOT EXISTS scraper_tasks (
+                id VARCHAR(36) PRIMARY KEY,
+                type VARCHAR(50) NOT NULL,
+                status VARCHAR(20) NOT NULL,
+                progress FLOAT DEFAULT 0,
+                params JSONB DEFAULT '{}'::jsonb,
+                error TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                paused_at TIMESTAMP WITH TIME ZONE
+            );''',
+            '''CREATE TABLE IF NOT EXISTS scraper_logs (
+                id SERIAL PRIMARY KEY,
+                task_id VARCHAR(36) REFERENCES scraper_tasks(id) ON DELETE CASCADE,
+                message TEXT NOT NULL,
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                level VARCHAR(10) DEFAULT 'INFO'
             );'''
         ]
         
